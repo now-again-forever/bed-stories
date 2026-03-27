@@ -41,18 +41,22 @@ function getRealAudioDuration(url) {
    PERSIST — localStorage with proper number/null handling
 ───────────────────────────────────────────────────────────── */
 function usePersist(key, initial) {
-  const [val, setVal] = useState(() => {
-    if (typeof window === 'undefined') return initial;
+  const [val, setVal] = useState(initial);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
     try {
       const s = localStorage.getItem(`bs_${key}`);
-      return s !== null ? JSON.parse(s) : initial;
-    } catch {
-      return initial;
-    }
-  });
+      if (s !== null) setVal(JSON.parse(s));
+    } catch {}
+    setMounted(true);
+  }, [key]);
+
   useEffect(() => {
+    if (!mounted) return;
     try { localStorage.setItem(`bs_${key}`, JSON.stringify(val)); } catch {}
-  }, [key, val]);
+  }, [key, val, mounted]);
+
   return [val, setVal];
 }
 
@@ -138,6 +142,7 @@ COMPOSITION:
 - Portrait orientation (9:16 vertical) — animal centered and filling the frame
 - Intimate and close — we are right there with the animal
 - Documentary-style macro photography of a real handmade diorama
+- --ar 9:16 vertical composition, portrait orientation, full-frame subject, centered for mobile viewing, cinematic framing, no horizontal cropping, designed for TikTok screen
 
 Output ONLY the prompt text. No introduction, no explanation.`,
 

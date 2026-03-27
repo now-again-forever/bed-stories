@@ -3,7 +3,7 @@ import supabaseAdmin from '../../../lib/supabaseAdmin';
 
 const VOICES = {
   nicole: 'gc5LArFpEOmYx9nYmK9l',
-  damon: 'xzZRXG86mSM3naOyL9fa',
+  damon:  'xzZRXG86mSM3naOyL9fa',
 };
 
 export default async function handler(req, res) {
@@ -33,12 +33,15 @@ export default async function handler(req, res) {
     }
 
     const { audio_base64, alignment } = await elevenRes.json();
-    const { characters, character_start_times_seconds: starts, character_end_times_seconds: ends } = alignment;
+    const {
+      characters,
+      character_start_times_seconds: starts,
+      character_end_times_seconds: ends,
+    } = alignment;
 
-    // Upload audio to Supabase Storage
+    // Upload audio to Supabase
     const audioBuffer = Buffer.from(audio_base64, 'base64');
     const filename = `bedstory-${Date.now()}.mp3`;
-
     const { error: uploadError } = await supabaseAdmin.storage
       .from('bedstories-audio')
       .upload(filename, audioBuffer, {
@@ -52,20 +55,44 @@ export default async function handler(req, res) {
       .from('bedstories-audio')
       .getPublicUrl(filename);
 
-    // Convert character alignment to word timings
+    // Build word timings
     const fullText = segments.map(s => s.text).join(' ');
     const wordTimings = charToWords(fullText, characters, starts, ends);
     const audioDuration = ends.at(-1) + 0.5;
 
-    // Find when Damon's narration starts (after Nicole's segments)
-    const nicoleText = segments
-      .filter(s => s.speaker === 'nicole')
-      .map(s => s.text)
-      .join(' ');
-    const nicoleCharCount = nicoleText.length;
-    const damonStartTime = starts[Math.min(nicoleCharCount + 1, starts.length - 1)] ?? 0;
+    // Find the character offset of Damon's SECOND segment.
+    // Story structure:
+    //   seg 0 — Nicole:  "Damon, tell me a story."
+    //   seg 1 — Damon:   "What story would you like to hear?"  ← skip this one
+    //   seg 2 — Nicole:  "The one about the bears..."
+    //   seg 3 — Damon:   [actual narration starts here]        ← use this one
+    //
+    // We walk the segments array accumulating character offsets (+1 for space separator)
+    // and stop when we hit the second Damon segment.
+    let damonCount = 0;
+    let charOffset = 0;
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (seg.speaker === 'damon') {
+        damonCount++;
+        if (damonCount === 2) {
+          // charOffset now points to the first character of this segment
+          break;
+        }
+      }
+      // Move past this segment (+1 for the space in join(' '))
+      charOffset += seg.text.length + 1;
+    }
 
-    return res.json({ audioUrl: urlData.publicUrl, wordTimings, audioDuration, damonStartTime });
+    const damonStartTime = starts[Math.min(charOffset, starts.length - 1)] ?? 0;
+    console.log(`Damon narration (2nd segment) starts at char ${charOffset} → ${damonStartTime.toFixed(2)}s`);
+
+    return res.json({
+      audioUrl: urlData.publicUrl,
+      wordTimings,
+      audioDuration,
+      damonStartTime,
+    });
   } catch (e) {
     console.error('dialogue error:', e);
     return res.status(500).json({ error: e.message });
@@ -78,7 +105,7 @@ function charToWords(fullText, chars, starts, ends) {
   for (const token of fullText.split(/(\s+)/)) {
     if (!token.trim()) { ci += token.length; continue; }
     const wordStart = starts[ci] ?? 0;
-    const wordEnd = ends[Math.min(ci + token.length - 1, ends.length - 1)] ?? wordStart + 0.3;
+    const wordEnd   = ends[Math.min(ci + token.length - 1, ends.length - 1)] ?? wordStart + 0.3;
     words.push({ word: token, start: wordStart, end: wordEnd });
     ci += token.length;
   }
