@@ -448,7 +448,22 @@ function StepVisual({
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = ev => { setImageUrl(ev.target.result); setVideoUrl(null); };
+    reader.onload = ev => {
+      // Resize to max 1080px before storing — prevents 413 on upload
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const MAX_W = 1080;
+        const MAX_H = 1920;
+        const ratio = Math.min(MAX_W / img.width, MAX_H / img.height, 1);
+        canvas.width  = Math.round(img.width  * ratio);
+        canvas.height = Math.round(img.height * ratio);
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        setImageUrl(canvas.toDataURL("image/jpeg", 0.92));
+        setVideoUrl(null);
+      };
+      img.src = ev.target.result;
+    };
     reader.readAsDataURL(file);
   };
 
