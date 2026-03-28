@@ -472,31 +472,24 @@ function StepVisual({
     try {
       let publicImageUrl = imageUrl;
       if (imageUrl.startsWith('data:')) {
-        // Upload directly from browser to Supabase — bypasses Vercel body size limits entirely
-        const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-        const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+        // Convert base64 to blob and POST as multipart — keeps payload small
         const base64 = imageUrl.split(',')[1];
-        const mime  = imageUrl.split(';')[0].split(':')[1];
-        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-        const filename = `bs-upload-${Date.now()}.jpg`;
-        const uploadRes = await fetch(
-          `${SUPABASE_URL}/storage/v1/object/bedstories-audio/${filename}`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${SUPABASE_ANON}`,
-              'Content-Type': mime,
-              'x-upsert': 'true',
-            },
-            body: bytes,
-          }
-        );
-        if (!uploadRes.ok) {
-          const err = await uploadRes.json().catch(() => ({}));
-          throw new Error(`Image upload failed: ${err.message || uploadRes.status}`);
+        const mime   = imageUrl.split(';')[0].split(':')[1];
+        const bytes  = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        const blob   = new Blob([bytes], { type: mime });
+        const form   = new FormData();
+        form.append('file', blob, 'image.jpg');
+        const r = await fetch('/api/bedstories/upload-image-binary', {
+          method: 'POST',
+          body: form,
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(`Image upload failed: ${err.error || r.status}`);
         }
-        publicImageUrl = `${SUPABASE_URL}/storage/v1/object/public/bedstories-audio/${filename}`;
-        setImageUrl(publicImageUrl);
+        const { url } = await r.json();
+        publicImageUrl = url;
+        setImageUrl(url);
       }
       const { requestId } = await post('animate', { imageUrl: publicImageUrl });
       let found = false;
