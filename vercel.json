@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "pages/api/bedstories/dialogue.js":    { "maxDuration": 300 },
+    "pages/api/bedstories/animate.js":     { "maxDuration": 300 },
+    "pages/api/bedstories/animate-poll.js":{ "maxDuration": 300 },
+    "pages/api/bedstories/render.js":      { "maxDuration": 300 },
+    "pages/api/bedstories/poll.js":        { "maxDuration": 300 }
+  }
+}

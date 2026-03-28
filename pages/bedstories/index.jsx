@@ -459,7 +459,7 @@ function StepVisual({
         canvas.width  = Math.round(img.width  * ratio);
         canvas.height = Math.round(img.height * ratio);
         canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-        setImageUrl(canvas.toDataURL("image/jpeg", 0.92));
+        setImageUrl(canvas.toDataURL("image/jpeg", 0.80));
         setVideoUrl(null);
       };
       img.src = ev.target.result;
@@ -472,9 +472,31 @@ function StepVisual({
     try {
       let publicImageUrl = imageUrl;
       if (imageUrl.startsWith('data:')) {
-        const { url } = await post('upload-image', { dataUrl: imageUrl });
-        publicImageUrl = url;
-        setImageUrl(url);
+        // Upload directly from browser to Supabase — bypasses Vercel body size limits entirely
+        const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+        const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+        const base64 = imageUrl.split(',')[1];
+        const mime  = imageUrl.split(';')[0].split(':')[1];
+        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        const filename = `bs-upload-${Date.now()}.jpg`;
+        const uploadRes = await fetch(
+          `${SUPABASE_URL}/storage/v1/object/bedstories-audio/${filename}`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${SUPABASE_ANON}`,
+              'Content-Type': mime,
+              'x-upsert': 'true',
+            },
+            body: bytes,
+          }
+        );
+        if (!uploadRes.ok) {
+          const err = await uploadRes.json().catch(() => ({}));
+          throw new Error(`Image upload failed: ${err.message || uploadRes.status}`);
+        }
+        publicImageUrl = `${SUPABASE_URL}/storage/v1/object/public/bedstories-audio/${filename}`;
+        setImageUrl(publicImageUrl);
       }
       const { requestId } = await post('animate', { imageUrl: publicImageUrl });
       let found = false;
