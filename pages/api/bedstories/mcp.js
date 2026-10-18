@@ -1,17 +1,20 @@
 // pages/api/bedstories/mcp.js
 //
-// Minimal MCP server (Streamable HTTP, stateless JSON) exposing Shotstack
-// render + poll as tools, so the Bedstories Claude artifact can trigger the
-// final assembly through a claude.ai custom connector.
+// MCP server (Streamable HTTP, stateless JSON) for the Bedstories Claude
+// artifact, added in claude.ai as the custom connector "Bedstories":
+//   https://bed-stories.vercel.app/api/bedstories/mcp[?key=<MCP_SECRET>]
+// Set MCP_SECRET in Vercel env to lock it; unset, the endpoint is open.
 //
-// Add in claude.ai → Settings → Connectors → Add custom connector:
-//   https://bed-stories.vercel.app/api/bedstories/mcp?key=<MCP_SECRET>
-// Set MCP_SECRET in Vercel env (any long random string). If unset, the
-// endpoint is open — fine for testing, not for leaving up.
+// Tools
+//   narrate_start / narrate_status — two-voice narration via ElevenLabs
+//       text-to-dialogue WITH timestamps, saved to Supabase (permanent URL),
+//       returning exact word timings for subtitles. Runs in the background.
+//   render_video / poll_render — Shotstack assembly; captions from the word
+//       timings; the finished MP4 is copied to Supabase so links never expire.
+//   list_library — previously uploaded felt-animal images.
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const BUCKET = 'bedstories-audio';
-const assetUrl = (f) => `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${f}`;
+import { waitUntil } from '@vercel/functions';
+import { BUCKET, publicUrl, newId, readJob, writeJob, runNarration, runSaveRender } from '../../../lib/bedstoriesJobs';
 
 const SOUND_FILE = {
   'Rain':           'bs-rain.mp3',
@@ -26,62 +29,106 @@ const PIANO_CLIP_DURATION = 188;
 const PIANO_FADE_BUFFER = 4;
 const VIDEO_CLIP = 5;
 
+const WORD = { type: 'object', required: ['word', 'start', 'end'], properties: { word: { type: 'string' }, start: { type: 'number' }, end: { type: 'number' } } };
+
 const TOOLS = [
   {
-    name: 'render_video',
-    description:
-      'Assemble a Bedstories video with Shotstack: looped 5s video, one or more narration clips placed sequentially, piano from damonStartTime, ambient sound throughout. Returns renderId; poll with poll_render.',
+    name: 'narrate_start',
+    description: 'Start two-voice narration of a Bedstories script (Nicole + Damon) with ElevenLabs, with exact word timestamps. Returns jobId immediately; poll narrate_status every ~5s.',
     inputSchema: {
-      type: 'object',
-      required: ['videoUrl', 'narration'],
+      type: 'object', required: ['segments'],
+      properties: {
+        segments: {
+          type: 'array', description: 'Script in order. Paragraph breaks (blank lines) inside a segment are kept as natural pauses.',
+          items: { type: 'object', required: ['speaker', 'text'], properties: { speaker: { type: 'string', enum: ['nicole', 'damon'] }, text: { type: 'string' } } },
+        },
+      },
+    },
+  },
+  {
+    name: 'narrate_status',
+    description: 'Status of a narration job: { status: queued|running|done|failed, progress, audioUrl, duration, damonStartTime, words[] }. audioUrl is permanent.',
+    inputSchema: { type: 'object', required: ['jobId'], properties: { jobId: { type: 'string' } } },
+  },
+  {
+    name: 'render_video',
+    description: 'Assemble a Bedstories video with Shotstack: looped 5s video, narration, piano from damonStartTime, ambient bed, and (with words) burned-in TikTok-style subtitles timed to the real speech. Returns renderId; poll with poll_render.',
+    inputSchema: {
+      type: 'object', required: ['videoUrl', 'audioUrl', 'audioDuration'],
       properties: {
         videoUrl: { type: 'string', description: 'Public MP4 URL of the looping visual' },
-        narration: {
-          type: 'array',
-          description: 'Narration clips in order. Each has a public audio URL and its duration in seconds.',
-          items: {
-            type: 'object',
-            required: ['url', 'duration'],
-            properties: {
-              url: { type: 'string' },
-              duration: { type: 'number' },
-              speaker: { type: 'string', description: 'nicole | damon (informational)' },
-              text: { type: 'string', description: 'What this clip says; used to time burned-in subtitles' },
-            },
-          },
-        },
-        gapSeconds: { type: 'number', description: 'Silence between narration clips (default 0.6)' },
-        damonStartTime: { type: 'number', description: 'Seconds at which piano starts (default: start of 2nd damon clip, else 0)' },
+        audioUrl: { type: 'string', description: 'Narration MP3 (from narrate_status)' },
+        audioDuration: { type: 'number', description: 'Narration length in seconds' },
+        damonStartTime: { type: 'number', description: 'Seconds at which piano starts' },
+        words: { type: 'array', items: WORD, description: 'Word timings from narrate_status; enables subtitles' },
+        subtitles: { type: 'boolean', description: 'Burn in subtitles (default true when words are given)' },
         sound: { type: 'string', enum: Object.keys(SOUND_FILE), description: 'Ambient bed (default Rain)' },
         outputFormat: { type: 'string', enum: ['vertical', 'horizontal'] },
         cropWatermark: { type: 'boolean', description: 'Zoom video 15% to hide bottom-right watermarks' },
-        subtitles: { type: 'boolean', description: 'Burn in bold TikTok-style captions from each clip\'s text (default true when text is present)' },
       },
     },
+  },
+  {
+    name: 'poll_render',
+    description: 'Check a Shotstack render. Returns { status: queued|rendering|saving|done|failed, url, temporary }. When done, url is a permanent copy in Supabase (temporary:true means the copy failed and the 24h Shotstack link is returned instead).',
+    inputSchema: { type: 'object', required: ['renderId'], properties: { renderId: { type: 'string' } } },
   },
   {
     name: 'list_library',
     description: 'List previously uploaded felt-animal images (public URLs) from the Bedstories Supabase bucket, newest first.',
     inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max items (default 40)' } } },
   },
-  {
-    name: 'poll_render',
-    description: 'Check a Shotstack render. Returns { status: queued|rendering|done|failed, url }.',
-    inputSchema: {
-      type: 'object',
-      required: ['renderId'],
-      properties: { renderId: { type: 'string' } },
-    },
-  },
 ];
 
-function clipsTiled(src, from, to, clipLen, volume) {
-  const clips = [];
-  let t = from;
+// ── subtitles from real word timings ─────────────────────────────────────
+const isDivider = (w) => /^[·•.\-–—*]+$/.test(w);
+function captionLines(words, { maxWords = 4, maxChars = 22, gap = 0.45 } = {}) {
+  const ws = words.filter(w => w.word && !isDivider(w.word)).map(w => ({ ...w, word: w.word.replace(/["“”]/g, '') })).filter(w => w.word);
+  const lines = []; let cur = [];
+  const text = (a) => a.map(w => w.word).join(' ');
+  const flush = () => { if (cur.length) { lines.push(cur); cur = []; } };
+  for (let i = 0; i < ws.length; i++) {
+    const w = ws[i], prev = cur[cur.length - 1];
+    if (prev && (w.start - prev.end > gap || cur.length >= maxWords || text([...cur, w]).length > maxChars)) flush();
+    cur.push(w);
+    if (/[.!?;:,—]$/.test(w.word)) flush();
+  }
+  flush();
+  // Fold a lone non-final word back into the previous line when it fits
+  const merged = [];
+  for (const l of lines) {
+    const p = merged[merged.length - 1];
+    if (p && l.length === 1 && !/[.!?]$/.test(p[p.length - 1].word) && text([...p, ...l]).length <= maxChars + 6 && l[0].start - p[p.length - 1].end < gap) p.push(...l);
+    else merged.push(l);
+  }
+  return merged.map((l, i) => {
+    const next = merged[i + 1];
+    const start = l[0].start;
+    // Hold each line until the next one starts (no flicker), but not more than 0.6s past its last word
+    const end = Math.min(next ? next[0].start : Infinity, l[l.length - 1].end + 0.6);
+    return { text: text(l), start, end: Math.max(end, start + 0.3) };
+  });
+}
+const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function captionTrack(words, size) {
+  const vertical = size.height > size.width;
+  const boxW = vertical ? 960 : 1500, boxH = vertical ? 340 : 240, fontPx = vertical ? 78 : 64;
+  const css = `p { font-family: 'Montserrat ExtraBold', 'Montserrat', 'Open Sans Bold', sans-serif; font-weight: 800; font-size: ${fontPx}px; line-height: 1.12; color: #FFFFFF; text-align: center; text-transform: uppercase; letter-spacing: 1px; margin: 0; text-shadow: -4px -4px 0 #000, 4px -4px 0 #000, -4px 4px 0 #000, 4px 4px 0 #000, 0 -4px 0 #000, 0 4px 0 #000, -4px 0 0 #000, 4px 0 0 #000, 0 8px 14px rgba(0,0,0,.55); }`;
+  return captionLines(words).map(l => ({
+    asset: { type: 'html', html: `<p>${escHtml(l.text)}</p>`, css, width: boxW, height: boxH, position: 'center' },
+    start: Number(l.start.toFixed(3)),
+    length: Number((l.end - l.start).toFixed(3)),
+    position: 'center',
+    offset: { x: 0, y: vertical ? -0.22 : -0.30 },
+  }));
+}
+
+// ── assembly ─────────────────────────────────────────────────────────────
+function tiledAudio(src, from, to, clipLen, volume) {
+  const clips = []; let t = from;
   while (t < to) {
     const len = Math.min(clipLen, to - t);
-    const isFirst = t === from;
-    const isLast = t + len >= to;
+    const isFirst = t === from, isLast = t + len >= to;
     const effect = isFirst && isLast ? 'fadeInFadeOut' : isFirst ? 'fadeIn' : isLast ? 'fadeOut' : 'none';
     clips.push({ asset: { type: 'audio', src, volume, effect }, start: t, length: len });
     t += len;
@@ -89,124 +136,37 @@ function clipsTiled(src, from, to, clipLen, volume) {
   return clips;
 }
 
-// ── Subtitles ────────────────────────────────────────────────────────────
-// The restricted ElevenLabs connector gives no word timestamps, so each
-// clip's duration is spread over its text by weight: characters, plus extra
-// time where the narrator pauses (sentence ends, commas). TTS pace is even
-// enough that this lands within a word or so on a 10-minute story.
-function cleanForCaptions(text) {
-  return String(text || '')
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !/^[·•.\s]+$/.test(l))   // drop "· · ·" scene dividers
-    .join(' ')
-    .replace(/["“”]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-function chunkWords(text, maxWords = 4, maxChars = 22) {
-  const words = text.split(' ').filter(Boolean);
-  const chunks = []; let cur = [];
-  const len = (a) => a.join(' ').length;
-  for (const w of words) {
-    if (cur.length && (cur.length >= maxWords || len([...cur, w]) > maxChars)) { chunks.push(cur.join(' ')); cur = []; }
-    cur.push(w);
-    if (/[.!?;:,—]$/.test(w)) { chunks.push(cur.join(' ')); cur = []; }   // never run across a pause
-  }
-  if (cur.length) chunks.push(cur.join(' '));
-  // A lone word flashing up reads badly: fold it back into the previous line
-  // when that line didn't end a sentence and the result still fits.
-  const merged = [];
-  for (const c of chunks) {
-    const prev = merged[merged.length - 1];
-    if (prev && !c.includes(' ') && !/[.!?]$/.test(prev) && (prev + ' ' + c).length <= maxChars + 6) merged[merged.length - 1] = prev + ' ' + c;
-    else merged.push(c);
-  }
-  return merged;
-}
-const weight = (c) => c.length + (/[.!?]$/.test(c) ? 10 : /[,;:—]$/.test(c) ? 5 : 1);
-const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-function captionClips(narrationClips, narration, size) {
-  const vertical = size.height > size.width;
-  const boxW = vertical ? 960 : 1500, boxH = vertical ? 340 : 240;
-  const fontPx = vertical ? 78 : 64;
-  // Heavy white type with a thick black outline + soft drop shadow: legible
-  // over any part of the felt scene on a phone.
-  const css = `p { font-family: 'Montserrat ExtraBold', 'Montserrat', 'Open Sans Bold', sans-serif; font-weight: 800; font-size: ${fontPx}px; line-height: 1.12; color: #FFFFFF; text-align: center; text-transform: uppercase; letter-spacing: 1px; margin: 0; text-shadow: -4px -4px 0 #000, 4px -4px 0 #000, -4px 4px 0 #000, 4px 4px 0 #000, 0 -4px 0 #000, 0 4px 0 #000, -4px 0 0 #000, 4px 0 0 #000, 0 8px 14px rgba(0,0,0,.55); }`;
-  const out = [];
-  narrationClips.forEach((nc, i) => {
-    const chunks = chunkWords(cleanForCaptions(narration[i]?.text));
-    if (!chunks.length) return;
-    const total = chunks.reduce((a, c) => a + weight(c), 0);
-    let t = nc.start;
-    for (const c of chunks) {
-      const len = (nc.length * weight(c)) / total;
-      out.push({
-        asset: { type: 'html', html: `<p>${escHtml(c)}</p>`, css, width: boxW, height: boxH, position: 'center' },
-        start: Number(t.toFixed(3)),
-        length: Number(Math.max(len, 0.25).toFixed(3)),
-        position: 'center',
-        offset: { x: 0, y: vertical ? -0.22 : -0.30 },
-      });
-      t += len;
-    }
-  });
-  return out;
-}
-
 async function renderVideo(args) {
-  const {
-    videoUrl, narration = [], gapSeconds = 0.6, sound = 'Rain',
-    outputFormat = 'vertical', cropWatermark = false,
-  } = args;
-  if (!videoUrl || !narration.length) throw new Error('videoUrl and narration[] are required');
+  const { videoUrl, audioUrl, words, sound = 'Rain', outputFormat = 'vertical', cropWatermark = false } = args;
+  const audioDuration = Number(args.audioDuration);
+  if (!videoUrl || !audioUrl || !(audioDuration > 0)) throw new Error('videoUrl, audioUrl and audioDuration are required');
 
-  // Lay narration clips end to end
-  const narrationClips = [];
-  let t = 0;
-  let damonSeen = 0;
-  let damonStart = typeof args.damonStartTime === 'number' ? args.damonStartTime : null;
-  for (const n of narration) {
-    const len = Number(n.duration) || 0;
-    if (!n.url || len <= 0) throw new Error('each narration clip needs url and positive duration');
-    if (n.speaker === 'damon') { damonSeen++; if (damonSeen === 2 && damonStart === null) damonStart = t; }
-    narrationClips.push({ asset: { type: 'audio', src: n.url, volume: 1.0 }, start: t, length: len });
-    t += len + gapSeconds;
-  }
-  const totalDuration = t - gapSeconds + 0.5;
-  if (damonStart === null) damonStart = 0;
-
-  const pianoStart = damonStart;
+  const totalDuration = audioDuration + 0.5;
+  const pianoStart = Number(args.damonStartTime) || 0;
   const pianoEnd = Math.max(totalDuration - PIANO_FADE_BUFFER, pianoStart + 1);
+  const size = outputFormat === 'horizontal' ? { width: 1920, height: 1080 } : { width: 1080, height: 1920 };
 
-  const videoClips = [];
-  let vt = 0;
+  const videoClips = []; let vt = 0;
   while (vt < totalDuration) {
     const len = Math.min(VIDEO_CLIP, totalDuration - vt);
-    videoClips.push({
-      asset: { type: 'video', src: videoUrl, trim: 0, volume: 0 },
-      start: vt, length: len, fit: 'cover',
-      ...(cropWatermark ? { scale: 1.15 } : {}),
-    });
+    videoClips.push({ asset: { type: 'video', src: videoUrl, trim: 0, volume: 0 }, start: vt, length: len, fit: 'cover', ...(cropWatermark ? { scale: 1.15 } : {}) });
     vt += len;
   }
 
-  const size = outputFormat === 'horizontal' ? { width: 1920, height: 1080 } : { width: 1080, height: 1920 };
-
-  const wantSubs = args.subtitles !== false && narration.some(n => (n.text || '').trim());
+  const wantSubs = args.subtitles !== false && Array.isArray(words) && words.length > 0;
+  const captions = wantSubs ? captionTrack(words, size) : [];
 
   const payload = {
     timeline: {
       tracks: [
-        ...(wantSubs ? [{ clips: captionClips(narrationClips, narration, size) }] : []),
-        { clips: narrationClips },
-        { clips: clipsTiled(assetUrl('bs-piano-v2.mp3'), pianoStart, pianoEnd, PIANO_CLIP_DURATION, 0.12) },
-        { clips: clipsTiled(assetUrl(SOUND_FILE[sound] || 'bs-rain.mp3'), 0, totalDuration, AMBIENT_CLIP_DURATION, 0.15) },
+        ...(captions.length ? [{ clips: captions }] : []),
+        { clips: [{ asset: { type: 'audio', src: audioUrl, volume: 1.0 }, start: 0, length: audioDuration }] },
+        { clips: tiledAudio(publicUrl('bs-piano-v2.mp3'), pianoStart, pianoEnd, PIANO_CLIP_DURATION, 0.12) },
+        { clips: tiledAudio(publicUrl(SOUND_FILE[sound] || 'bs-rain.mp3'), 0, totalDuration, AMBIENT_CLIP_DURATION, 0.15) },
         { clips: videoClips },
       ],
     },
-    output: { format: 'mp4', size },
+    output: { format: 'mp4', size, fps: 25, quality: 'medium' },
   };
 
   const r = await fetch('https://api.shotstack.io/v1/render', {
@@ -216,49 +176,63 @@ async function renderVideo(args) {
   });
   const data = await r.json();
   if (!data.success) throw new Error(JSON.stringify(data.response || data.message || data));
-  return { renderId: data.response.id, totalDuration, damonStartTime: damonStart };
-}
-
-async function listLibrary({ limit = 40 } = {}) {
-  const { default: supabaseAdmin } = await import('../../../lib/supabaseAdmin');
-  const { data, error } = await supabaseAdmin.storage.from(BUCKET).list('', {
-    limit: 200, sortBy: { column: 'created_at', order: 'desc' },
-  });
-  if (error) throw new Error(`Supabase list failed: ${error.message}`);
-  const items = (data || [])
-    .filter(f => /^bs-upload-.*\.(jpe?g|png|webp)$/i.test(f.name))
-    .slice(0, limit)
-    .map(f => ({ name: f.name, url: assetUrl(f.name), createdAt: f.created_at }));
-  return { items };
+  return { renderId: data.response.id, totalDuration, captionLines: captions.length };
 }
 
 async function pollRender({ renderId }) {
   if (!renderId) throw new Error('renderId required');
-  const r = await fetch(`https://api.shotstack.io/v1/render/${renderId}`, {
-    headers: { 'x-api-key': process.env.SHOTSTACK_API_KEY },
-  });
+  const saved = await readJob(`render-${renderId}`);
+  if (saved?.status === 'done') return { status: 'done', url: saved.url, temporary: !!saved.temporary, saveError: saved.saveError || null };
+  if (saved?.status === 'saving') return { status: 'saving', url: null };
+
+  const r = await fetch(`https://api.shotstack.io/v1/render/${renderId}`, { headers: { 'x-api-key': process.env.SHOTSTACK_API_KEY } });
   const data = await r.json();
   if (!data.success) throw new Error('Shotstack poll failed');
   const s = data.response?.status;
-  const status = s === 'done' ? 'done' : s === 'failed' ? 'failed' : s === 'queued' ? 'queued' : 'rendering';
-  return { status, url: data.response?.url || null, error: data.response?.error || null };
+  if (s === 'failed') return { status: 'failed', url: null, error: data.response?.error || 'Shotstack render failed' };
+  if (s !== 'done') return { status: s === 'queued' ? 'queued' : 'rendering', url: null };
+
+  // Shotstack is done: copy the MP4 to Supabase in the background
+  await writeJob(`render-${renderId}`, { kind: 'render', status: 'saving' });
+  waitUntil(runSaveRender(renderId, data.response.url));
+  return { status: 'saving', url: null };
 }
 
+async function narrateStart({ segments }) {
+  const segs = (segments || []).filter(s => s && s.text && String(s.text).trim());
+  if (!segs.length) throw new Error('segments[] with text is required');
+  const jobId = newId('narr');
+  await writeJob(jobId, { kind: 'narration', status: 'queued' });
+  waitUntil(runNarration(jobId, segs));
+  return { jobId, status: 'queued' };
+}
+
+async function narrateStatus({ jobId }) {
+  if (!jobId) throw new Error('jobId required');
+  const j = await readJob(jobId);
+  if (!j) return { status: 'queued' };   // the job file can lag a moment behind narrate_start
+  return j;
+}
+
+async function listLibrary({ limit = 40 } = {}) {
+  const { default: supabaseAdmin } = await import('../../../lib/supabaseAdmin');
+  const { data, error } = await supabaseAdmin.storage.from(BUCKET).list('', { limit: 200, sortBy: { column: 'created_at', order: 'desc' } });
+  if (error) throw new Error(`Supabase list failed: ${error.message}`);
+  return { items: (data || []).filter(f => /^bs-upload-.*\.(jpe?g|png|webp)$/i.test(f.name)).slice(0, limit).map(f => ({ name: f.name, url: publicUrl(f.name), createdAt: f.created_at })) };
+}
+
+// ── JSON-RPC ─────────────────────────────────────────────────────────────
 const rpc = (id, result) => ({ jsonrpc: '2.0', id, result });
 const rpcErr = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
+const HANDLERS = { narrate_start: narrateStart, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
 
 export default async function handler(req, res) {
-  // Auth: shared secret in query string
   const secret = process.env.MCP_SECRET;
   if (secret && req.query.key !== secret) return res.status(401).json({ error: 'unauthorized' });
-
-  if (req.method === 'GET' || req.method === 'DELETE') return res.status(405).end();
   if (req.method !== 'POST') return res.status(405).end();
 
   const msg = req.body;
   if (!msg || msg.jsonrpc !== '2.0') return res.status(400).json(rpcErr(null, -32600, 'Invalid request'));
-
-  // Notifications carry no id and expect no body
   if (msg.id === undefined || msg.id === null) return res.status(202).end();
 
   try {
@@ -267,37 +241,26 @@ export default async function handler(req, res) {
         return res.json(rpc(msg.id, {
           protocolVersion: msg.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: {} },
-          serverInfo: { name: 'bedstories', version: '1.0.0' },
-          instructions: 'Render Bedstories videos with Shotstack. Call render_video, then poll_render every ~10s until status is done.',
+          serverInfo: { name: 'bedstories', version: '2.0.0' },
+          instructions: 'Bedstories production backend. Narrate with narrate_start then poll narrate_status (~5s) until done; pass its audioUrl, duration, damonStartTime and words to render_video; poll poll_render (~10s) until done. All returned media URLs are permanent.',
         }));
-      case 'ping':
-        return res.json(rpc(msg.id, {}));
-      case 'tools/list':
-        return res.json(rpc(msg.id, { tools: TOOLS }));
+      case 'ping': return res.json(rpc(msg.id, {}));
+      case 'tools/list': return res.json(rpc(msg.id, { tools: TOOLS }));
       case 'tools/call': {
         const { name, arguments: args = {} } = msg.params || {};
-        let out;
-        if (name === 'render_video') out = await renderVideo(args);
-        else if (name === 'poll_render') out = await pollRender(args);
-        else if (name === 'list_library') out = await listLibrary(args);
-        else return res.json(rpcErr(msg.id, -32602, `Unknown tool: ${name}`));
-        return res.json(rpc(msg.id, {
-          content: [{ type: 'text', text: JSON.stringify(out) }],
-          structuredContent: out,
-          isError: false,
-        }));
+        const fn = HANDLERS[name];
+        if (!fn) return res.json(rpcErr(msg.id, -32602, `Unknown tool: ${name}`));
+        const out = await fn(args);
+        // Word arrays are large; keep the text block short and put the full result in structuredContent
+        const summary = name === 'narrate_status' && out?.words ? { ...out, words: `[${out.words.length} words]` } : out;
+        return res.json(rpc(msg.id, { content: [{ type: 'text', text: JSON.stringify(summary) }], structuredContent: out, isError: false }));
       }
-      default:
-        return res.json(rpcErr(msg.id, -32601, `Method not found: ${msg.method}`));
+      default: return res.json(rpcErr(msg.id, -32601, `Method not found: ${msg.method}`));
     }
   } catch (e) {
     console.error('mcp error:', e);
-    // Tool failures are reported inside the result so the client sees the message
-    return res.json(rpc(msg.id, {
-      content: [{ type: 'text', text: e.message || String(e) }],
-      isError: true,
-    }));
+    return res.json(rpc(msg.id, { content: [{ type: 'text', text: e.message || String(e) }], isError: true }));
   }
 }
 
-export const config = { api: { bodyParser: { sizeLimit: '2mb' } } };
+export const config = { api: { bodyParser: { sizeLimit: '4mb' } } };
