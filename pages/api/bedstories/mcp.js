@@ -46,6 +46,7 @@ const TOOLS = [
               url: { type: 'string' },
               duration: { type: 'number' },
               speaker: { type: 'string', description: 'nicole | damon (informational)' },
+              text: { type: 'string', description: 'What this clip says; used to time burned-in subtitles' },
             },
           },
         },
@@ -54,6 +55,7 @@ const TOOLS = [
         sound: { type: 'string', enum: Object.keys(SOUND_FILE), description: 'Ambient bed (default Rain)' },
         outputFormat: { type: 'string', enum: ['vertical', 'horizontal'] },
         cropWatermark: { type: 'boolean', description: 'Zoom video 15% to hide bottom-right watermarks' },
+        subtitles: { type: 'boolean', description: 'Burn in bold TikTok-style captions from each clip\'s text (default true when text is present)' },
       },
     },
   },
@@ -85,6 +87,72 @@ function clipsTiled(src, from, to, clipLen, volume) {
     t += len;
   }
   return clips;
+}
+
+// ── Subtitles ────────────────────────────────────────────────────────────
+// The restricted ElevenLabs connector gives no word timestamps, so each
+// clip's duration is spread over its text by weight: characters, plus extra
+// time where the narrator pauses (sentence ends, commas). TTS pace is even
+// enough that this lands within a word or so on a 10-minute story.
+function cleanForCaptions(text) {
+  return String(text || '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !/^[·•.\s]+$/.test(l))   // drop "· · ·" scene dividers
+    .join(' ')
+    .replace(/["“”]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function chunkWords(text, maxWords = 4, maxChars = 22) {
+  const words = text.split(' ').filter(Boolean);
+  const chunks = []; let cur = [];
+  const len = (a) => a.join(' ').length;
+  for (const w of words) {
+    if (cur.length && (cur.length >= maxWords || len([...cur, w]) > maxChars)) { chunks.push(cur.join(' ')); cur = []; }
+    cur.push(w);
+    if (/[.!?;:,—]$/.test(w)) { chunks.push(cur.join(' ')); cur = []; }   // never run across a pause
+  }
+  if (cur.length) chunks.push(cur.join(' '));
+  // A lone word flashing up reads badly: fold it back into the previous line
+  // when that line didn't end a sentence and the result still fits.
+  const merged = [];
+  for (const c of chunks) {
+    const prev = merged[merged.length - 1];
+    if (prev && !c.includes(' ') && !/[.!?]$/.test(prev) && (prev + ' ' + c).length <= maxChars + 6) merged[merged.length - 1] = prev + ' ' + c;
+    else merged.push(c);
+  }
+  return merged;
+}
+const weight = (c) => c.length + (/[.!?]$/.test(c) ? 10 : /[,;:—]$/.test(c) ? 5 : 1);
+const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function captionClips(narrationClips, narration, size) {
+  const vertical = size.height > size.width;
+  const boxW = vertical ? 960 : 1500, boxH = vertical ? 340 : 240;
+  const fontPx = vertical ? 78 : 64;
+  // Heavy white type with a thick black outline + soft drop shadow: legible
+  // over any part of the felt scene on a phone.
+  const css = `p { font-family: 'Montserrat ExtraBold', 'Montserrat', 'Open Sans Bold', sans-serif; font-weight: 800; font-size: ${fontPx}px; line-height: 1.12; color: #FFFFFF; text-align: center; text-transform: uppercase; letter-spacing: 1px; margin: 0; text-shadow: -4px -4px 0 #000, 4px -4px 0 #000, -4px 4px 0 #000, 4px 4px 0 #000, 0 -4px 0 #000, 0 4px 0 #000, -4px 0 0 #000, 4px 0 0 #000, 0 8px 14px rgba(0,0,0,.55); }`;
+  const out = [];
+  narrationClips.forEach((nc, i) => {
+    const chunks = chunkWords(cleanForCaptions(narration[i]?.text));
+    if (!chunks.length) return;
+    const total = chunks.reduce((a, c) => a + weight(c), 0);
+    let t = nc.start;
+    for (const c of chunks) {
+      const len = (nc.length * weight(c)) / total;
+      out.push({
+        asset: { type: 'html', html: `<p>${escHtml(c)}</p>`, css, width: boxW, height: boxH, position: 'center' },
+        start: Number(t.toFixed(3)),
+        length: Number(Math.max(len, 0.25).toFixed(3)),
+        position: 'center',
+        offset: { x: 0, y: vertical ? -0.22 : -0.30 },
+      });
+      t += len;
+    }
+  });
+  return out;
 }
 
 async function renderVideo(args) {
@@ -126,9 +194,12 @@ async function renderVideo(args) {
 
   const size = outputFormat === 'horizontal' ? { width: 1920, height: 1080 } : { width: 1080, height: 1920 };
 
+  const wantSubs = args.subtitles !== false && narration.some(n => (n.text || '').trim());
+
   const payload = {
     timeline: {
       tracks: [
+        ...(wantSubs ? [{ clips: captionClips(narrationClips, narration, size) }] : []),
         { clips: narrationClips },
         { clips: clipsTiled(assetUrl('bs-piano-v2.mp3'), pianoStart, pianoEnd, PIANO_CLIP_DURATION, 0.12) },
         { clips: clipsTiled(assetUrl(SOUND_FILE[sound] || 'bs-rain.mp3'), 0, totalDuration, AMBIENT_CLIP_DURATION, 0.15) },
