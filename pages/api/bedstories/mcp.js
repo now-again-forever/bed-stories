@@ -112,14 +112,17 @@ function captionLines(words, { maxWords = 4, maxChars = 22, gap = 0.45 } = {}) {
 const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 function captionTrack(words, size) {
   const vertical = size.height > size.width;
-  const boxW = vertical ? 960 : 1500, boxH = vertical ? 340 : 240, fontPx = vertical ? 78 : 64;
-  const css = `p { font-family: 'Montserrat ExtraBold', 'Montserrat', 'Open Sans Bold', sans-serif; font-weight: 800; font-size: ${fontPx}px; line-height: 1.12; color: #FFFFFF; text-align: center; text-transform: uppercase; letter-spacing: 1px; margin: 0; text-shadow: -4px -4px 0 #000, 4px -4px 0 #000, -4px 4px 0 #000, 4px 4px 0 #000, 0 -4px 0 #000, 0 4px 0 #000, -4px 0 0 #000, 4px 0 0 #000, 0 8px 14px rgba(0,0,0,.55); }`;
+  // Calm, sleep-friendly captions: sentence case, warm off-white, semi-bold,
+  // a soft shadow instead of a hard outline. Still readable on a phone over
+  // the felt scene, without shouting.
+  const boxW = vertical ? 900 : 1400, boxH = vertical ? 220 : 160, fontPx = vertical ? 46 : 40;
+  const css = `p { font-family: 'Montserrat SemiBold', 'Montserrat', 'Open Sans', sans-serif; font-weight: 600; font-size: ${fontPx}px; line-height: 1.25; color: #FFF6E8; text-align: center; letter-spacing: 0.3px; margin: 0; text-shadow: 0 2px 3px rgba(0,0,0,.75), 0 0 14px rgba(0,0,0,.45); }`;
   return captionLines(words).map(l => ({
     asset: { type: 'html', html: `<p>${escHtml(l.text)}</p>`, css, width: boxW, height: boxH, position: 'center' },
     start: Number(l.start.toFixed(3)),
     length: Number((l.end - l.start).toFixed(3)),
     position: 'center',
-    offset: { x: 0, y: vertical ? -0.22 : -0.30 },
+    offset: { x: 0, y: vertical ? -0.26 : -0.32 },
   }));
 }
 
