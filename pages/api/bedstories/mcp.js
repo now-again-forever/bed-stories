@@ -14,7 +14,7 @@
 //   list_library — previously uploaded felt-animal images.
 
 import { waitUntil } from '@vercel/functions';
-import { BUCKET, publicUrl, newId, readJob, writeJob, runNarration, runSaveRender } from '../../../lib/bedstoriesJobs';
+import { BUCKET, publicUrl, newId, readJob, writeJob, runNarration, runRealign, runSaveRender } from '../../../lib/bedstoriesJobs';
 
 const SOUND_FILE = {
   'Rain':           'bs-rain.mp3',
@@ -42,6 +42,17 @@ const TOOLS = [
           type: 'array', description: 'Script in order. Paragraph breaks (blank lines) inside a segment are kept as natural pauses.',
           items: { type: 'object', required: ['speaker', 'text'], properties: { speaker: { type: 'string', enum: ['nicole', 'damon'] }, text: { type: 'string' } } },
         },
+      },
+    },
+  },
+  {
+    name: 'narrate_realign',
+    description: 'Re-time an existing narration MP3 against its script with forced alignment (no re-recording, no TTS credits). Returns jobId; poll narrate_status.',
+    inputSchema: {
+      type: 'object', required: ['audioUrl', 'segments'],
+      properties: {
+        audioUrl: { type: 'string', description: 'The narration MP3 from an earlier narrate_status' },
+        segments: { type: 'array', items: { type: 'object', required: ['speaker', 'text'], properties: { speaker: { type: 'string', enum: ['nicole', 'damon'] }, text: { type: 'string' } } } },
       },
     },
   },
@@ -169,7 +180,10 @@ async function renderVideo(args) {
         { clips: videoClips },
       ],
     },
-    output: { format: 'mp4', size, fps: 25, quality: 'medium' },
+    // 'low' keeps a 6-minute 1080×1920 story small enough to store permanently
+    // (medium came out at ~7.4 Mbps / 191 MB); the scene is nearly still, and
+    // TikTok and Instagram re-encode on upload regardless.
+    output: { format: 'mp4', size, fps: 25, quality: 'low' },
   };
 
   const r = await fetch('https://api.shotstack.io/v1/render', {
@@ -210,6 +224,15 @@ async function narrateStart({ segments }) {
   return { jobId, status: 'queued' };
 }
 
+async function narrateRealign({ audioUrl, segments }) {
+  const segs = (segments || []).filter(s => s && s.text && String(s.text).trim());
+  if (!audioUrl || !segs.length) throw new Error('audioUrl and segments[] are required');
+  const jobId = newId('align');
+  await writeJob(jobId, { kind: 'narration', status: 'queued', audioUrl });
+  waitUntil(runRealign(jobId, audioUrl, segs));
+  return { jobId, status: 'queued' };
+}
+
 async function narrateStatus({ jobId }) {
   if (!jobId) throw new Error('jobId required');
   const j = await readJob(jobId);
@@ -227,7 +250,7 @@ async function listLibrary({ limit = 40 } = {}) {
 // ── JSON-RPC ─────────────────────────────────────────────────────────────
 const rpc = (id, result) => ({ jsonrpc: '2.0', id, result });
 const rpcErr = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
-const HANDLERS = { narrate_start: narrateStart, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
+const HANDLERS = { narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
 
 export default async function handler(req, res) {
   const secret = process.env.MCP_SECRET;
@@ -245,7 +268,7 @@ export default async function handler(req, res) {
           protocolVersion: msg.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: {} },
           serverInfo: { name: 'bedstories', version: '2.0.0' },
-          instructions: 'Bedstories production backend. Narrate with narrate_start then poll narrate_status (~5s) until done; pass its audioUrl, duration, damonStartTime and words to render_video; poll poll_render (~10s) until done. All returned media URLs are permanent.',
+          instructions: 'Bedstories production backend. Narrate with narrate_start then poll narrate_status (~5s) until done (subtitle timings come from forced alignment of the finished audio); pass its audioUrl, duration, damonStartTime and words to render_video; poll poll_render (~10s) until done. All returned media URLs are permanent.',
         }));
       case 'ping': return res.json(rpc(msg.id, {}));
       case 'tools/list': return res.json(rpc(msg.id, { tools: TOOLS }));
