@@ -133,8 +133,12 @@ function captionTrack(words, size) {
   // Calm, sleep-friendly captions: sentence case, warm off-white, semi-bold,
   // a soft shadow instead of a hard outline. Still readable on a phone over
   // the felt scene, without shouting.
-  const boxW = vertical ? 900 : 1400, boxH = vertical ? 220 : 160, fontPx = vertical ? 46 : 40;
-  const css = `p { font-family: 'Montserrat SemiBold', 'Montserrat', 'Open Sans', sans-serif; font-weight: 600; font-size: ${fontPx}px; line-height: 1.25; color: #FFF6E8; text-align: center; letter-spacing: 0.3px; margin: 0; text-shadow: 0 2px 3px rgba(0,0,0,.75), 0 0 14px rgba(0,0,0,.45); }`;
+  // Outline built from eight offset shadows (the renderer has no text-stroke),
+  // plus a soft drop shadow so it also holds up over bright parts of the scene.
+  const boxW = vertical ? 960 : 1500, boxH = vertical ? 260 : 190, fontPx = vertical ? 58 : 50;
+  const o = 3;
+  const outline = [[-o,-o],[o,-o],[-o,o],[o,o],[0,-o],[0,o],[-o,0],[o,0]].map(([x, y]) => `${x}px ${y}px 0 #000`).join(', ');
+  const css = `p { font-family: 'Montserrat SemiBold', 'Montserrat', 'Open Sans', sans-serif; font-weight: 600; font-size: ${fontPx}px; line-height: 1.22; color: #FFF6E8; text-align: center; letter-spacing: 0.3px; margin: 0; text-shadow: ${outline}, 0 4px 10px rgba(0,0,0,.55); }`;
   return captionLines(words).map(l => ({
     asset: { type: 'html', html: `<p>${escHtml(l.text)}</p>`, css, width: boxW, height: boxH, position: 'center' },
     start: Number(l.start.toFixed(3)),
