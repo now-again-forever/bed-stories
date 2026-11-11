@@ -138,24 +138,33 @@ const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>
 //   3. Any single line still too wide (one very long word) has its own font
 //      shrunk to fit. Nothing is ever clipped or pushed off screen.
 const SUB_STYLE = {
-  vertical:   { fontPx: 58, safeW: 820,  boxH: 240, y: -0.2, maxWords: 4 },
-  horizontal: { fontPx: 50, safeW: 1500, boxH: 190, y: -0.3, maxWords: 6 },
+  vertical:   { fontPx: 64, safeW: 820,  boxH: 240, y: -0.2, maxWords: 4 },
+  horizontal: { fontPx: 54, safeW: 1500, boxH: 190, y: -0.3, maxWords: 6 },
 };
 const CHAR_W = 0.62;      // average glyph width ÷ font size for Montserrat SemiBold, rounded up
 const MIN_FONT_PX = 34;   // floor for guard 3; below this a long word wraps instead (the box holds two rows)
 const estWidth = (text, fontPx) => text.length * fontPx * CHAR_W;
 
+// Subtitles are Shotstack "rich-text" clips, which draw a real stroke around
+// each letter. (The earlier HTML clips faked the border with stacked
+// text-shadows, and Shotstack's HTML renderer dropped them, leaving only a
+// soft shadow.)
 function captionTrack(words, size) {
   const st = size.height > size.width ? SUB_STYLE.vertical : SUB_STYLE.horizontal;
   const maxChars = Math.max(8, Math.floor(st.safeW / (st.fontPx * CHAR_W)) - 3);             // guard 2
-  const o = Math.max(2, Math.round(st.fontPx / 19));
-  const outline = [[-o,-o],[o,-o],[-o,o],[o,o],[0,-o],[0,o],[-o,0],[o,0]].map(([x, y]) => `${x}px ${y}px 0 #000`).join(', ');
-  const cssFor = (px) => `p { font-family: 'Montserrat SemiBold', 'Montserrat', 'Open Sans', sans-serif; font-weight: 600; font-size: ${px}px; line-height: 1.22; color: #FFF6E8; text-align: center; letter-spacing: 0.3px; margin: 0; text-shadow: ${outline}, 0 4px 10px rgba(0,0,0,.55); }`;
   return captionLines(words, { maxWords: st.maxWords, maxChars, mergeSlack: 3 }).map(l => {
     const w = estWidth(l.text, st.fontPx);
     const px = w <= st.safeW ? st.fontPx : Math.max(MIN_FONT_PX, Math.floor(st.fontPx * st.safeW / w));   // guard 3
     return {
-      asset: { type: 'html', html: `<p>${escHtml(l.text)}</p>`, css: cssFor(px), width: st.safeW, height: st.boxH, position: 'center' },   // guard 1
+      asset: {
+        type: 'rich-text', text: l.text,
+        font: { family: 'Montserrat', size: px, weight: 700, color: '#FFF6E8', opacity: 1 },
+        style: { lineHeight: 1.2, letterSpacing: 0 },
+        stroke: { width: Math.max(4, Math.round(px / 10)), color: '#000000', opacity: 1 },
+        shadow: { offsetX: 0, offsetY: 4, blur: 8, color: '#000000', opacity: 0.55 },
+        align: { horizontal: 'center', vertical: 'middle' },
+      },
+      width: st.safeW, height: st.boxH,                                                        // guard 1
       start: Number(l.start.toFixed(3)),
       length: Number((l.end - l.start).toFixed(3)),
       position: 'center',
@@ -282,11 +291,40 @@ async function narrateRealign({ jobId: fromJob, audioUrl, segments }) {
   return { jobId, status: 'queued' };
 }
 
+// Do the subtitle timings match the recording? Measured, not guessed: every
+// script word should have a timing, timings should run forwards, reach the
+// end of the audio, and never leave a long hole with no caption.
+function syncReport(j) {
+  const ws = Array.isArray(j.words) ? j.words : [];
+  const scriptWords = (j.script || []).reduce((n, s) => n + String(s.text || '').split(/\s+/).filter(Boolean).length, 0);
+  let backwards = 0, maxGap = 0, gapAt = 0, zero = 0;
+  for (let i = 0; i < ws.length; i++) {
+    if (!(ws[i].end > ws[i].start)) zero++;
+    if (i && ws[i].start < ws[i - 1].start - 0.02) backwards++;
+    if (i) { const g = ws[i].start - ws[i - 1].end; if (g > maxGap) { maxGap = g; gapAt = ws[i - 1].end; } }
+  }
+  const last = ws.length ? ws[ws.length - 1].end : 0, first = ws.length ? ws[0].start : 0;
+  const coverage = scriptWords ? ws.length / scriptWords : null;
+  const problems = [];
+  if (j.alignment !== 'forced') problems.push('timings were not taken from the finished audio');
+  if (!ws.length) problems.push('no word timings');
+  if (coverage !== null && (coverage < 0.97 || coverage > 1.03)) problems.push(`${ws.length} timed words for ${scriptWords} script words`);
+  if (backwards) problems.push(`${backwards} words run backwards in time`);
+  if (zero > ws.length * 0.02) problems.push(`${zero} words have no length`);
+  if (first > 4) problems.push(`first word starts at ${first.toFixed(1)}s`);
+  if (j.duration && last < j.duration - 6) problems.push(`timings stop ${(j.duration - last).toFixed(1)}s before the audio ends`);
+  if (j.duration && last > j.duration + 0.5) problems.push('timings run past the end of the audio');
+  if (maxGap > 9) problems.push(`a ${maxGap.toFixed(1)}s hole with no words at ${gapAt.toFixed(0)}s`);
+  if (!(j.damonStartTime > 2)) problems.push('piano cue is at the very start (story body not found)');
+  return { ok: problems.length === 0, problems, timedWords: ws.length, scriptWords, maxGap: Number(maxGap.toFixed(2)), lastWordEnd: Number(last.toFixed(2)) };
+}
+
 async function narrateStatus({ jobId, includeWords = true }) {
   if (!jobId) throw new Error('jobId required');
   const j = await readJob(jobId);
   if (!j) return { status: 'queued' };   // the job file can lag a moment behind narrate_start
   const { script, ...rest } = j;
+  if (j.status === 'done') rest.sync = syncReport(j);
   if (!includeWords) delete rest.words;
   return rest;
 }
