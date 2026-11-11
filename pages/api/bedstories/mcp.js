@@ -100,7 +100,7 @@ const TOOLS = [
 
 // ── subtitles from real word timings ─────────────────────────────────────
 const isDivider = (w) => /^[·•.\-–—*]+$/.test(w);
-function captionLines(words, { maxWords = 4, maxChars = 22, gap = 0.45 } = {}) {
+function captionLines(words, { maxWords = 4, maxChars = 22, mergeSlack = 6, gap = 0.45 } = {}) {
   const ws = words.filter(w => w.word && !isDivider(w.word)).map(w => ({ ...w, word: w.word.replace(/["“”]/g, '') })).filter(w => w.word);
   const lines = []; let cur = [];
   const text = (a) => a.map(w => w.word).join(' ');
@@ -116,7 +116,7 @@ function captionLines(words, { maxWords = 4, maxChars = 22, gap = 0.45 } = {}) {
   const merged = [];
   for (const l of lines) {
     const p = merged[merged.length - 1];
-    if (p && l.length === 1 && !/[.!?]$/.test(p[p.length - 1].word) && text([...p, ...l]).length <= maxChars + 6 && l[0].start - p[p.length - 1].end < gap) p.push(...l);
+    if (p && l.length === 1 && !/[.!?]$/.test(p[p.length - 1].word) && text([...p, ...l]).length <= maxChars + mergeSlack && l[0].start - p[p.length - 1].end < gap) p.push(...l);
     else merged.push(l);
   }
   return merged.map((l, i) => {
@@ -128,24 +128,40 @@ function captionLines(words, { maxWords = 4, maxChars = 22, gap = 0.45 } = {}) {
   });
 }
 const escHtml = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// ── THE SUBTITLE SAFE-AREA RULE ──────────────────────────────────────────
+// Subtitles must never leave the phone-safe area, whatever size they are set
+// to. Change SUB_STYLE freely; the three guards below keep the result legal.
+//   1. The box is the safe area: clear of the right-hand TikTok/Reels buttons
+//      (130px each side on a 1080 frame) and of the caption zone at the bottom.
+//   2. The line length limit is DERIVED from the font size and box width, so a
+//      bigger font automatically means fewer characters per line.
+//   3. Any single line still too wide (one very long word) has its own font
+//      shrunk to fit. Nothing is ever clipped or pushed off screen.
+const SUB_STYLE = {
+  vertical:   { fontPx: 58, safeW: 820,  boxH: 240, y: -0.2, maxWords: 4 },
+  horizontal: { fontPx: 50, safeW: 1500, boxH: 190, y: -0.3, maxWords: 6 },
+};
+const CHAR_W = 0.62;      // average glyph width ÷ font size for Montserrat SemiBold, rounded up
+const MIN_FONT_PX = 34;   // floor for guard 3; below this a long word wraps instead (the box holds two rows)
+const estWidth = (text, fontPx) => text.length * fontPx * CHAR_W;
+
 function captionTrack(words, size) {
-  const vertical = size.height > size.width;
-  // Calm, sleep-friendly captions: sentence case, warm off-white, semi-bold,
-  // a soft shadow instead of a hard outline. Still readable on a phone over
-  // the felt scene, without shouting.
-  // Outline built from eight offset shadows (the renderer has no text-stroke),
-  // plus a soft drop shadow so it also holds up over bright parts of the scene.
-  const boxW = vertical ? 960 : 1500, boxH = vertical ? 260 : 190, fontPx = vertical ? 58 : 50;
-  const o = 3;
+  const st = size.height > size.width ? SUB_STYLE.vertical : SUB_STYLE.horizontal;
+  const maxChars = Math.max(8, Math.floor(st.safeW / (st.fontPx * CHAR_W)) - 3);             // guard 2
+  const o = Math.max(2, Math.round(st.fontPx / 19));
   const outline = [[-o,-o],[o,-o],[-o,o],[o,o],[0,-o],[0,o],[-o,0],[o,0]].map(([x, y]) => `${x}px ${y}px 0 #000`).join(', ');
-  const css = `p { font-family: 'Montserrat SemiBold', 'Montserrat', 'Open Sans', sans-serif; font-weight: 600; font-size: ${fontPx}px; line-height: 1.22; color: #FFF6E8; text-align: center; letter-spacing: 0.3px; margin: 0; text-shadow: ${outline}, 0 4px 10px rgba(0,0,0,.55); }`;
-  return captionLines(words).map(l => ({
-    asset: { type: 'html', html: `<p>${escHtml(l.text)}</p>`, css, width: boxW, height: boxH, position: 'center' },
-    start: Number(l.start.toFixed(3)),
-    length: Number((l.end - l.start).toFixed(3)),
-    position: 'center',
-    offset: { x: 0, y: vertical ? -0.26 : -0.32 },
-  }));
+  const cssFor = (px) => `p { font-family: 'Montserrat SemiBold', 'Montserrat', 'Open Sans', sans-serif; font-weight: 600; font-size: ${px}px; line-height: 1.22; color: #FFF6E8; text-align: center; letter-spacing: 0.3px; margin: 0; text-shadow: ${outline}, 0 4px 10px rgba(0,0,0,.55); }`;
+  return captionLines(words, { maxWords: st.maxWords, maxChars, mergeSlack: 3 }).map(l => {
+    const w = estWidth(l.text, st.fontPx);
+    const px = w <= st.safeW ? st.fontPx : Math.max(MIN_FONT_PX, Math.floor(st.fontPx * st.safeW / w));   // guard 3
+    return {
+      asset: { type: 'html', html: `<p>${escHtml(l.text)}</p>`, css: cssFor(px), width: st.safeW, height: st.boxH, position: 'center' },   // guard 1
+      start: Number(l.start.toFixed(3)),
+      length: Number((l.end - l.start).toFixed(3)),
+      position: 'center',
+      offset: { x: 0, y: st.y },
+    };
+  });
 }
 
 // ── assembly ─────────────────────────────────────────────────────────────
