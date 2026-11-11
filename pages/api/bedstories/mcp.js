@@ -14,7 +14,7 @@
 //   list_library — previously uploaded felt-animal images.
 
 import { waitUntil } from '@vercel/functions';
-import { BUCKET, publicUrl, newId, readJob, writeJob, runNarration, runRealign, runSaveRender } from '../../../lib/bedstoriesJobs';
+import { BUCKET, publicUrl, newId, readJob, writeJob, runNarration, runRealign, runSaveRender, shotstackHostedUrl } from '../../../lib/bedstoriesJobs';
 
 const SOUND_FILE = {
   'Rain':           'bs-rain.mp3',
@@ -46,11 +46,17 @@ const TOOLS = [
     },
   },
   {
+    name: 'health',
+    description: 'Check the backend: API keys present, storage reachable, endpoint locked. Returns { ok, problems[], locked }.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'narrate_realign',
     description: 'Re-time an existing narration MP3 against its script with forced alignment (no re-recording, no TTS credits). Returns jobId; poll narrate_status.',
     inputSchema: {
-      type: 'object', required: ['audioUrl', 'segments'],
+      type: 'object',
       properties: {
+        jobId: { type: 'string', description: 'Preferred: jobId of an earlier narration; its audio and script are reused.' },
         audioUrl: { type: 'string', description: 'The narration MP3 from an earlier narrate_status' },
         segments: { type: 'array', items: { type: 'object', required: ['speaker', 'text'], properties: { speaker: { type: 'string', enum: ['nicole', 'damon'] }, text: { type: 'string' } } } },
       },
@@ -59,15 +65,16 @@ const TOOLS = [
   {
     name: 'narrate_status',
     description: 'Status of a narration job: { status: queued|running|done|failed, progress, audioUrl, duration, damonStartTime, words[] }. audioUrl is permanent.',
-    inputSchema: { type: 'object', required: ['jobId'], properties: { jobId: { type: 'string' } } },
+    inputSchema: { type: 'object', required: ['jobId'], properties: { jobId: { type: 'string' }, includeWords: { type: 'boolean', description: 'Default true. Pass false to skip the word list (render_video can load it by narrationJobId).' } } },
   },
   {
     name: 'render_video',
     description: 'Assemble a Bedstories video with Shotstack: looped 5s video, narration, piano from damonStartTime, ambient bed, and (with words) burned-in TikTok-style subtitles timed to the real speech. Returns renderId; poll with poll_render.',
     inputSchema: {
-      type: 'object', required: ['videoUrl', 'audioUrl', 'audioDuration'],
+      type: 'object', required: ['videoUrl'],
       properties: {
         videoUrl: { type: 'string', description: 'Public MP4 URL of the looping visual' },
+        narrationJobId: { type: 'string', description: 'Preferred: the jobId of a finished narration. Audio, duration, piano cue and word timings are loaded server-side, so audioUrl/audioDuration/words can be omitted.' },
         audioUrl: { type: 'string', description: 'Narration MP3 (from narrate_status)' },
         audioDuration: { type: 'number', description: 'Narration length in seconds' },
         damonStartTime: { type: 'number', description: 'Seconds at which piano starts' },
@@ -151,9 +158,17 @@ function tiledAudio(src, from, to, clipLen, volume) {
 }
 
 async function renderVideo(args) {
+  // Preferred: narrationJobId. The backend already holds the audio, its real
+  // length and every word timing, so nothing large travels through the page.
+  if (args.narrationJobId) {
+    const j = await readJob(args.narrationJobId);
+    if (!j || j.status !== 'done') throw new Error('That narration is not finished (or was not found). Record it again.');
+    if (args.subtitles !== false && j.alignment !== 'forced') throw new Error('This recording has no exact word timings yet. Re-time it first (narrate_realign), then render.');
+    args = { ...args, audioUrl: j.audioUrl, audioDuration: j.duration, damonStartTime: args.damonStartTime ?? j.damonStartTime, words: j.words };
+  }
   const { videoUrl, audioUrl, words, sound = 'Rain', outputFormat = 'vertical', cropWatermark = false } = args;
   const audioDuration = Number(args.audioDuration);
-  if (!videoUrl || !audioUrl || !(audioDuration > 0)) throw new Error('videoUrl, audioUrl and audioDuration are required');
+  if (!videoUrl || !audioUrl || !(audioDuration > 0)) throw new Error('videoUrl plus narrationJobId (or audioUrl and audioDuration) are required');
 
   const totalDuration = audioDuration + 0.5;
   const pianoStart = Number(args.damonStartTime) || 0;
@@ -199,8 +214,16 @@ async function renderVideo(args) {
 async function pollRender({ renderId }) {
   if (!renderId) throw new Error('renderId required');
   const saved = await readJob(`render-${renderId}`);
-  if (saved?.status === 'done') return { status: 'done', url: saved.url, temporary: !!saved.temporary, saveError: saved.saveError || null };
-  if (saved?.status === 'saving') return { status: 'saving', url: null };
+  if (saved?.status === 'done' && !saved.temporary) return { status: 'done', url: saved.url, temporary: false, host: saved.host || null };
+  if (saved?.status === 'done' && saved.temporary) {
+    // An earlier save fell back to the 24h link. Shotstack's CDN copy may exist: upgrade to it.
+    const hosted = await shotstackHostedUrl(renderId);
+    if (hosted) { await writeJob(`render-${renderId}`, { ...saved, url: hosted, temporary: false, host: 'shotstack-cdn' }); return { status: 'done', url: hosted, temporary: false, host: 'shotstack-cdn' }; }
+    return { status: 'done', url: saved.url, temporary: true, saveError: saved.saveError || null };
+  }
+  // A save that has sat for 3 minutes has died (timeout or crash): start it again below
+  const savingFresh = saved?.status === 'saving' && Date.now() - new Date(saved.updatedAt).getTime() < 3 * 60 * 1000;
+  if (savingFresh) return { status: 'saving', url: null };
 
   const r = await fetch(`https://api.shotstack.io/v1/render/${renderId}`, { headers: { 'x-api-key': process.env.SHOTSTACK_API_KEY } });
   const data = await r.json();
@@ -209,7 +232,6 @@ async function pollRender({ renderId }) {
   if (s === 'failed') return { status: 'failed', url: null, error: data.response?.error || 'Shotstack render failed' };
   if (s !== 'done') return { status: s === 'queued' ? 'queued' : 'rendering', url: null };
 
-  // Shotstack is done: copy the MP4 to Supabase in the background
   await writeJob(`render-${renderId}`, { kind: 'render', status: 'saving' });
   waitUntil(runSaveRender(renderId, data.response.url));
   return { status: 'saving', url: null };
@@ -224,20 +246,46 @@ async function narrateStart({ segments }) {
   return { jobId, status: 'queued' };
 }
 
-async function narrateRealign({ audioUrl, segments }) {
-  const segs = (segments || []).filter(s => s && s.text && String(s.text).trim());
-  if (!audioUrl || !segs.length) throw new Error('audioUrl and segments[] are required');
+async function narrateRealign({ jobId: fromJob, audioUrl, segments }) {
+  let segs = (segments || []).filter(s => s && s.text && String(s.text).trim());
+  if (fromJob) {
+    const j = await readJob(fromJob);
+    if (!j?.audioUrl) throw new Error('That narration was not found.');
+    audioUrl = audioUrl || j.audioUrl;
+    // The script saved with the job; for older jobs, rebuild it from the words that were spoken
+    if (!segs.length) segs = j.script?.length ? j.script : [{ speaker: 'damon', text: (j.words || []).map(w => w.word).join(' ') }];
+  }
+  if (!audioUrl || !segs.length) throw new Error('jobId, or audioUrl and segments[], are required');
   const jobId = newId('align');
   await writeJob(jobId, { kind: 'narration', status: 'queued', audioUrl });
   waitUntil(runRealign(jobId, audioUrl, segs));
   return { jobId, status: 'queued' };
 }
 
-async function narrateStatus({ jobId }) {
+async function narrateStatus({ jobId, includeWords = true }) {
   if (!jobId) throw new Error('jobId required');
   const j = await readJob(jobId);
   if (!j) return { status: 'queued' };   // the job file can lag a moment behind narrate_start
-  return j;
+  const { script, ...rest } = j;
+  if (!includeWords) delete rest.words;
+  return rest;
+}
+
+// One call that says what, if anything, is wrong with the backend.
+async function health() {
+  const out = { ok: true, problems: [] };
+  for (const k of ['ELEVENLABS_API_KEY', 'SHOTSTACK_API_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'NEXT_PUBLIC_SUPABASE_URL']) if (!process.env[k]) out.problems.push(`${k} is not set on Vercel`);
+  try {
+    const { default: supabaseAdmin } = await import('../../../lib/supabaseAdmin');
+    const { error } = await Promise.race([
+      supabaseAdmin.storage.from(BUCKET).list('', { limit: 1 }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timed out')), 8000)),
+    ]);
+    if (error) throw new Error(error.message);
+  } catch (e) { out.problems.push(`Storage is unreachable (${e.message}). The Supabase project is probably paused: restore it from the Supabase dashboard.`); }
+  out.locked = !!process.env.MCP_SECRET;
+  out.ok = out.problems.length === 0;
+  return out;
 }
 
 async function listLibrary({ limit = 40 } = {}) {
@@ -250,7 +298,7 @@ async function listLibrary({ limit = 40 } = {}) {
 // ── JSON-RPC ─────────────────────────────────────────────────────────────
 const rpc = (id, result) => ({ jsonrpc: '2.0', id, result });
 const rpcErr = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
-const HANDLERS = { narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
+const HANDLERS = { health, narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
 
 export default async function handler(req, res) {
   const secret = process.env.MCP_SECRET;

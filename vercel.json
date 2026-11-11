@@ -18,5 +18,11 @@
     "pages/api/bedstories/mcp.js": {
       "maxDuration": 300
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/bedstories/keepalive",
+      "schedule": "17 5 * * *"
+    }
+  ]
 }
