@@ -237,7 +237,14 @@ async function renderVideo(args) {
   });
   const data = await r.json();
   if (!data.success) throw new Error(JSON.stringify(data.response || data.message || data));
-  return { renderId: data.response.id, totalDuration, captionLines: captions.length };
+  // What should be on screen halfway through: lets the page check a real frame
+  // of the finished video against the subtitle that was meant to be showing.
+  const mid = totalDuration / 2;
+  const near = captions.filter(c => c.start + c.length > mid - 1.5 && c.start < mid + 1.5)
+    .map(c => ({ text: c.asset.text, start: c.start, end: Number((c.start + c.length).toFixed(3)) }));
+  const lastCaptionEnd = captions.length ? Number((captions[captions.length - 1].start + captions[captions.length - 1].length).toFixed(2)) : 0;
+  return { renderId: data.response.id, totalDuration, captionLines: captions.length,
+    check: { midTime: Number(mid.toFixed(2)), near, lastCaptionEnd, fontPx: captions[0]?.asset?.font?.size || null } };
 }
 
 async function pollRender({ renderId }) {
