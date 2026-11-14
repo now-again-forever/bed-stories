@@ -92,6 +92,16 @@ const TOOLS = [
     inputSchema: { type: 'object', required: ['renderId'], properties: { renderId: { type: 'string' } } },
   },
   {
+    name: 'fetch_images',
+    description: 'Fetch up to 4 images by URL (fal.media, Shotstack, Supabase only) and return them as image blocks, so a page that cannot load outside media can still look at them.',
+    inputSchema: { type: 'object', properties: { urls: { type: 'array', items: { type: 'string' }, description: '1-4 image URLs' } }, required: ['urls'] },
+  },
+  {
+    name: 'render_frames',
+    description: 'Two stills from a finished render, as image blocks: the exact middle frame, then a frame from just before the end.',
+    inputSchema: { type: 'object', properties: { renderId: { type: 'string' } }, required: ['renderId'] },
+  },
+  {
     name: 'list_library',
     description: 'List previously uploaded felt-animal images (public URLs) from the Bedstories Supabase bucket, newest first.',
     inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'Max items (default 40)' } } },
@@ -227,7 +237,11 @@ async function renderVideo(args) {
     // 'low' keeps a 6-minute 1080×1920 story small enough to store permanently
     // (medium came out at ~7.4 Mbps / 191 MB); the scene is nearly still, and
     // TikTok and Instagram re-encode on upload regardless.
-    output: { format: 'mp4', size, fps: 25, quality: 'low' },
+    // poster = a still from the exact middle, thumbnail = a still from just before the end.
+    // The page looks at both to check the finished video before it is posted.
+    output: { format: 'mp4', size, fps: 25, quality: 'low',
+      poster: { capture: Number((totalDuration / 2).toFixed(2)) },
+      thumbnail: { capture: Number(Math.max(0, totalDuration - 2).toFixed(2)), scale: 0.5 } },
   };
 
   const r = await fetch('https://api.shotstack.io/v1/render', {
@@ -271,6 +285,41 @@ async function pollRender({ renderId }) {
   await writeJob(`render-${renderId}`, { kind: 'render', status: 'saving' });
   waitUntil(runSaveRender(renderId, data.response.url));
   return { status: 'saving', url: null };
+}
+
+// ── images as blocks ─────────────────────────────────────────────────────
+// The page runs in a sandbox that cannot load outside images, so the backend
+// fetches them and hands them over inside the tool result.
+const IMAGE_HOSTS = /(^|\.)fal\.media$|(^|\.)shotstack\.io$|shotstack[^/]*\.amazonaws\.com$|(^|\.)supabase\.co$/i;
+const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+async function imageBlock(url) {
+  const u = new URL(url);
+  if (u.protocol !== 'https:' || !IMAGE_HOSTS.test(u.hostname)) throw new Error(`not an allowed image host: ${u.hostname}`);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`could not fetch the image (${r.status})`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > MAX_IMAGE_BYTES) throw new Error(`image is ${(buf.length / 1e6).toFixed(1)} MB, over the 3 MB limit`);
+  const sig = buf.subarray(0, 4).toString('hex');
+  const mimeType = sig.startsWith('ffd8') ? 'image/jpeg' : sig === '89504e47' ? 'image/png' : sig === '52494646' ? 'image/webp' : null;
+  if (!mimeType) throw new Error('that URL did not return a JPEG, PNG or WebP image');
+  return { type: 'image', data: buf.toString('base64'), mimeType };
+}
+async function fetchImages({ urls }) {
+  const list = (Array.isArray(urls) ? urls : []).filter(Boolean).slice(0, 4);
+  if (!list.length) throw new Error('urls[] is required');
+  const blocks = await Promise.all(list.map(imageBlock));
+  return { count: blocks.length, __content: blocks };
+}
+async function renderFrames({ renderId }) {
+  if (!renderId) throw new Error('renderId required');
+  const r = await fetch(`https://api.shotstack.io/v1/render/${renderId}`, { headers: { 'x-api-key': process.env.SHOTSTACK_API_KEY } });
+  const data = await r.json();
+  if (!data.success) throw new Error('Shotstack lookup failed');
+  const { poster, thumbnail, status } = data.response || {};
+  if (status !== 'done') throw new Error(`the render is not finished (${status})`);
+  if (!poster || !thumbnail) throw new Error('this render has no stills (it was made before stills were added, or they have expired)');
+  const blocks = await Promise.all([imageBlock(poster), imageBlock(thumbnail)]);
+  return { count: 2, order: ['middle', 'end'], __content: blocks };
 }
 
 async function narrateStart({ segments }) {
@@ -363,7 +412,7 @@ async function listLibrary({ limit = 40 } = {}) {
 // ── JSON-RPC ─────────────────────────────────────────────────────────────
 const rpc = (id, result) => ({ jsonrpc: '2.0', id, result });
 const rpcErr = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
-const HANDLERS = { health, narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
+const HANDLERS = { fetch_images: fetchImages, render_frames: renderFrames, health, narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
 
 export default async function handler(req, res) {
   const secret = process.env.MCP_SECRET;
@@ -391,6 +440,10 @@ export default async function handler(req, res) {
         if (!fn) return res.json(rpcErr(msg.id, -32602, `Unknown tool: ${name}`));
         const out = await fn(args);
         // Word arrays are large; keep the text block short and put the full result in structuredContent
+        if (out?.__content) {   // image blocks travel next to the JSON, not inside it
+          const { __content, ...meta } = out;
+          return res.json(rpc(msg.id, { content: [{ type: 'text', text: JSON.stringify(meta) }, ...__content], structuredContent: meta, isError: false }));
+        }
         const summary = name === 'narrate_status' && out?.words ? { ...out, words: `[${out.words.length} words]` } : out;
         return res.json(rpc(msg.id, { content: [{ type: 'text', text: JSON.stringify(summary) }], structuredContent: out, isError: false }));
       }
