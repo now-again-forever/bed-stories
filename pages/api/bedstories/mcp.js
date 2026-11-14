@@ -412,7 +412,7 @@ async function listLibrary({ limit = 40 } = {}) {
 // ── JSON-RPC ─────────────────────────────────────────────────────────────
 const rpc = (id, result) => ({ jsonrpc: '2.0', id, result });
 const rpcErr = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
-const HANDLERS = { fetch_images: fetchImages, render_frames: renderFrames, health, narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: pollRender, list_library: listLibrary };
+const HANDLERS = { fetch_images: fetchImages, render_frames: renderFrames, health, narrate_start: narrateStart, narrate_realign: narrateRealign, narrate_status: narrateStatus, render_video: renderVideo, poll_render: (a) => a?.frames ? renderFrames(a) : pollRender(a), list_library: (a) => Array.isArray(a?.images) ? fetchImages({ urls: a.images }) : listLibrary(a) };
 
 export default async function handler(req, res) {
   const secret = process.env.MCP_SECRET;
